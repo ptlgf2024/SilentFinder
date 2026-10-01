@@ -4,6 +4,11 @@ build/
 # Gradle 缓存
 .gradle/
 
+# 签名密钥（勿提交）
+*.keystore
+*.jks
+keystore.properties
+
 # 废弃的旧版依赖
 okhttp-3.14.9.jar
 okio-1.17.5.jar

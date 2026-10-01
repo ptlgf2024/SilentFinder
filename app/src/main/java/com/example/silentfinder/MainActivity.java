@@ -350,13 +350,15 @@ public class MainActivity extends Activity {
         appendLog("[引导] 已弹出保活设置引导（耗电管理 + 自启动）");
     }
 
-    /** 跳转自启动管理页面：设置 → 应用 → 自启动（ColorOS），其他厂商逐个尝试 */
+    /**
+     * 跳转自启动管理页面。
+     * adb 实测结论：ColorOS 自启动页真实组件为 com.oplus.battery/...StartupAppListActivity，
+     * 被签名级权限 oplus.permission.OPLUS_COMPONENT_SAFE 封锁，任何第三方 App 均无法直启（adb 也被拒）。
+     * 故 ColorOS 直接打开设置主页，用户按 设置→应用→自启动 手动进入。
+     */
     private void jumpToAutoStartSettings() {
+        // 其他厂商：组件直启（ColorOS 已封锁，此处服务于 MIUI/EMUI/OriginOS 等）
         String[][] candidates = {
-                // 一加 / OPPO（ColorOS）
-                {"com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupFilterListActivity"},
-                {"com.coloros.safecenter", "com.coloros.safecenter.startupapp.StartupAppListActivity"},
-                {"com.oppo.safe", "com.oppo.safe.permission.startup.StartupFilterListActivity"},
                 // 小米（MIUI）
                 {"com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"},
                 // 华为（EMUI / HarmonyOS）
@@ -372,19 +374,20 @@ public class MainActivity extends Activity {
                 i.setComponent(new android.content.ComponentName(c[0], c[1]));
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(i);
-                appendLog("[引导] 已跳转自启动管理页，请允许「静音寻车」自启动");
+                appendLog("[引导] 已直达自启动管理页，请允许「静音寻车」自启动");
                 Toast.makeText(this, "在列表中找到「静音寻车」并打开开关", Toast.LENGTH_LONG).show();
                 return;
             } catch (Exception ignored) {
                 // 该厂商页面不存在，尝试下一个
             }
         }
-        // 全部失败：提示 ColorOS 手动路径
-        appendLog("[引导] 未识别到自启动页，请手动到 设置→应用→自启动 允许「静音寻车」");
-        Toast.makeText(this, "请手动到 设置→应用→自启动 开启「静音寻车」", Toast.LENGTH_LONG).show();
+        // ColorOS 等：直接打开设置主页，用户按 设置→应用→自启动 进入
+        appendLog("[引导] 已打开设置，请进入 应用→自启动，为「静音寻车」打开开关");
+        Toast.makeText(this, "路径：设置 → 应用 → 自启动 → 静音寻车 开启", Toast.LENGTH_LONG).show();
         try {
-            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.parse("package:" + getPackageName())));
+            Intent home = new Intent(Settings.ACTION_SETTINGS);
+            home.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(home);
         } catch (Exception ignored) {
         }
     }
