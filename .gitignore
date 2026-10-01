@@ -1,0 +1,13 @@
+# 构建中间产物
+build/
+
+# Gradle 缓存
+.gradle/
+
+# 废弃的旧版依赖
+okhttp-3.14.9.jar
+okio-1.17.5.jar
+
+# 临时文件
+*.zip
+*.tmp
