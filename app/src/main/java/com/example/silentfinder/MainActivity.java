@@ -279,7 +279,8 @@ public class MainActivity extends Activity {
         final String[] items = {
                 "🔑  设置 authorization",
                 "🚗  设置车辆 IMEI",
-                "🔋  电池优化白名单",
+                "🔋  耗电管理（完全允许后台行为）",
+                "🚀  自启动设置",
                 "ℹ️  关于"
         };
         new AlertDialog.Builder(this)
@@ -293,6 +294,8 @@ public class MainActivity extends Activity {
                             showImeiSetting();
                         } else if (which == 2) {
                             requestIgnoreBatteryOptimizations();
+                        } else if (which == 3) {
+                            jumpToAutoStartSettings();
                         } else {
                             showAbout();
                         }
@@ -316,19 +319,21 @@ public class MainActivity extends Activity {
         if (!firstRun && ignored) return; // 非首次且已完成白名单：不再提醒
         if (!firstRun) {
             // 非首次但未加白名单：日志轻量提醒，不弹窗打扰
-            appendLog("[提醒] 尚未加入电池优化白名单，后台可能被冻结，建议到菜单中设置");
+            appendLog("[提醒] 耗电管理未设为「完全允许后台行为」，后台可能被冻结，建议到菜单中设置");
             return;
         }
         sp.edit().putBoolean(PREF_KEY_FIRST_RUN, false).apply();
 
         final String[] items = {
-                "🔋  电池优化白名单（最关键，点此跳转）",
-                "🚀  允许应用自启动（点此跳转厂商设置）",
+                "🔋  耗电管理：选「完全允许后台行为」（最关键）",
+                "🚀  自启动：允许「静音寻车」",
                 "❌  跳过，稍后再说"
         };
         new AlertDialog.Builder(this)
                 .setTitle("首次使用：完成两项设置\n保证后台常驻不被杀")
-                .setMessage("监听服务需要长期在后台运行，请完成以下设置（也可稍后在 ☰ 菜单中操作）：")
+                .setMessage("监听服务需要长期在后台运行，请到系统设置中完成（也可稍后在 ☰ 菜单中操作）：\n\n"
+                        + "① 耗电管理：设置 → 应用 → 应用管理 → 静音寻车 → 耗电管理 → 选「完全允许后台行为」\n\n"
+                        + "② 自启动：设置 → 应用 → 自启动 → 允许「静音寻车」")
                 .setItems(items, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
@@ -342,10 +347,10 @@ public class MainActivity extends Activity {
                 .setPositiveButton("完成", null)
                 .setCancelable(false)
                 .show();
-        appendLog("[引导] 已弹出保活设置引导（电池白名单 + 自启动）");
+        appendLog("[引导] 已弹出保活设置引导（耗电管理 + 自启动）");
     }
 
-    /** 跳转各厂商的自启动管理页面（一加/OPPO/小米/华为/vivo），均失败则提示手动设置 */
+    /** 跳转自启动管理页面：设置 → 应用 → 自启动（ColorOS），其他厂商逐个尝试 */
     private void jumpToAutoStartSettings() {
         String[][] candidates = {
                 // 一加 / OPPO（ColorOS）
@@ -367,18 +372,16 @@ public class MainActivity extends Activity {
                 i.setComponent(new android.content.ComponentName(c[0], c[1]));
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(i);
-                appendLog("[引导] 已跳转自启动管理页（" + c[0] + "），请允许本应用自启动");
-                Toast.makeText(this, "请在列表中找到「静音寻车」并允许自启动",
-                        Toast.LENGTH_LONG).show();
+                appendLog("[引导] 已跳转自启动管理页，请允许「静音寻车」自启动");
+                Toast.makeText(this, "在列表中找到「静音寻车」并打开开关", Toast.LENGTH_LONG).show();
                 return;
             } catch (Exception ignored) {
                 // 该厂商页面不存在，尝试下一个
             }
         }
-        // 全部失败：跳应用详情页兜底
-        appendLog("[引导] 未识别到厂商自启动页，请手动到 设置→应用→静音寻车 中允许自启动");
-        Toast.makeText(this, "未找到自启动管理页，请到 设置→应用管理→静音寻车 手动开启",
-                Toast.LENGTH_LONG).show();
+        // 全部失败：提示 ColorOS 手动路径
+        appendLog("[引导] 未识别到自启动页，请手动到 设置→应用→自启动 允许「静音寻车」");
+        Toast.makeText(this, "请手动到 设置→应用→自启动 开启「静音寻车」", Toast.LENGTH_LONG).show();
         try {
             startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                     Uri.parse("package:" + getPackageName())));
@@ -386,20 +389,21 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 引导用户将本应用加入电池优化白名单（后台常驻的关键一步） */
+    /** 引导用户到耗电管理页：设置 → 应用 → 应用管理 → 静音寻车 → 耗电管理 → 完全允许后台行为 */
     private void requestIgnoreBatteryOptimizations() {
+        // 优先尝试直接跳本应用详情页（ColorOS 的耗电管理入口就在应用详情页内）
         try {
-            Intent intent = new Intent(
-                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:" + getPackageName()));
-            startActivity(intent);
-            appendLog("[设置] 已打开电池优化白名单页面，请选择「允许」");
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+            appendLog("[设置] 已打开应用详情页，请进入「耗电管理」选「完全允许后台行为」");
+            Toast.makeText(this, "进入「耗电管理」→ 选「完全允许后台行为」", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             try {
                 startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
-                appendLog("[设置] 已打开电池优化列表，请在其中将本应用设为不优化");
+                appendLog("[设置] 已打开电池优化列表，请将本应用设为不优化");
             } catch (Exception e2) {
-                Toast.makeText(this, "请到系统设置-电池中手动设置", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "请到 设置→应用→应用管理→静音寻车→耗电管理 手动设置",
+                        Toast.LENGTH_LONG).show();
             }
         }
     }
