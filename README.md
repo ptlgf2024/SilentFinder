@@ -27,7 +27,7 @@ REQUEST_IGNORE_BATTERY_OPTIMIZATIONS  申请电池优化白名单
 
 ## 使用
 
-1. 安装 `SilentFinder.apk`，打开应用
+1. 安装 APK（`dist/SilentFinder-v2.16.apk`，或 [Releases](https://github.com/ptlgf2024/SilentFinder/releases)），打开应用
 2. 首次运行按引导完成两项设置（ColorOS 路径）：
    - 耗电管理：设置 → 应用 → 应用管理 → 静音寻车 → 耗电管理 → 选「**完全允许后台行为**」
    - 自启动：设置 → 应用 → 自启动 → 允许「静音寻车」
