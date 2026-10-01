@@ -511,11 +511,16 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    /** 关于对话框 */
+    /** 关于对话框（版本号从 APK 动态读取，避免硬编码不一致） */
     private void showAbout() {
+        String version = "";
+        try {
+            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception ignored) {
+        }
         new AlertDialog.Builder(this)
                 .setTitle("关于 SilentFinder")
-                .setMessage("SilentFinder（静音寻车）2.14\n\n"
+                .setMessage("SilentFinder（静音寻车）" + version + "\n\n"
                         + "一加手机三段式按键拨到静音档时，"
                         + "向台铃电动车服务器发送寻车指令，"
                         + "车辆鸣响闪灯方便定位。\n\n"

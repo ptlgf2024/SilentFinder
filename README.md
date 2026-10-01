@@ -2,7 +2,7 @@
 
 一加手机三段式静音键触发台铃（TAILG）电动车寻车模式的 Android 工具。
 
-**当前版本 2.15**（versionCode 27）
+**当前版本 2.16**（versionCode 28）
 
 ## 原理
 
