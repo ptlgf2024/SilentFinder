@@ -521,11 +521,12 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle("关于 SilentFinder")
                 .setMessage("SilentFinder（静音寻车）" + version + "\n\n"
-                        + "一加手机三段式按键拨到静音档时，"
-                        + "向台铃电动车服务器发送寻车指令，"
-                        + "车辆鸣响闪灯方便定位。\n\n"
+                        + "一加手机三段式按键触发台铃电动车指令：\n"
+                        + "· 拨到静音档 → 寻车（鸣响闪灯）\n"
+                        + "· 2 秒内双拨震动档 → 启动\n"
+                        + "· 拨到震动档保持不动 3 秒 → 停止\n\n"
                         + "· 前台服务常驻，看门狗闹钟保活，开机自启\n"
-                        + "· 仅静音档触发，震动/正常不触发\n"
+                        + "· 正常档不触发，拨离震动档即取消停止\n"
                         + "· authorization 过期后可在菜单中更新\n\n"
                         + "仅供个人自有设备使用。")
                 .setPositiveButton("确定", null)
