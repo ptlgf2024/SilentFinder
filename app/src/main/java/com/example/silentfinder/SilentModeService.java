@@ -30,6 +30,7 @@ import okhttp3.Response;
  * 拨到震动模式并保持不动 3 秒 → 发送车辆停止指令（cmd/stop）；
  * 离开震动档（拨到静音或正常）即取消停止计时。
  * authorization 必须在设置界面配置，未配置时不发送请求。
+ * 网络失败（DNS 解析失败、连接超时等瞬时故障）自动重试：间隔 3 秒，最多 3 次。
  * 所有事件通过广播发送到主界面显示。
  */
 public class SilentModeService extends Service {
@@ -53,6 +54,12 @@ public class SilentModeService extends Service {
      * 快速双拨（2 秒内）在保持计时到点前就已触发启动，不会误停。
      */
     private static final long HOLD_STOP_MS = 3_000L;
+
+    /** 网络失败自动重试次数（含首次在内共尝试的次数） */
+    private static final int MAX_ATTEMPTS = 3;
+
+    /** 每次重试前等待的时长：瞬时网络故障（弱信号断连、DNS 超时）通常几秒内自行恢复 */
+    private static final long RETRY_DELAY_MS = 3_000L;
 
     /** 上一次切换为震动模式的时刻（elapsedRealtime）；0 表示无记录 */
     private long lastVibrateAt = 0L;
@@ -260,40 +267,60 @@ public class SilentModeService extends Service {
         executor.execute(new Runnable() {
             @Override
             public void run() {
-                try {
-                    String jsonBody = "{\"imei\":\"" + imei + "\"}";
-                    MediaType mediaType = MediaType.parse("application/json; charset=UTF-8");
-                    RequestBody body = RequestBody.create(mediaType, jsonBody);
+                String jsonBody = "{\"imei\":\"" + imei + "\"}";
+                MediaType mediaType = MediaType.parse("application/json; charset=UTF-8");
+                RequestBody body = RequestBody.create(mediaType, jsonBody);
 
-                    Request request = new Request.Builder()
-                            .url(url)
-                            .header("host", "www.tailgdd.com")
-                            .header("authorization", auth)
-                            .header("forward-service-ip", "localhost")
-                            .header("language", "zh_CN")
-                            .header("content-type", "application/json; charset=UTF-8")
-                            .header("accept-encoding", "gzip")
-                            .header("user-agent", "okhttp/4.2.2")
-                            .post(body)
-                            .build();
+                for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                    try {
+                        Request request = new Request.Builder()
+                                .url(url)
+                                .header("host", "www.tailgdd.com")
+                                .header("authorization", auth)
+                                .header("forward-service-ip", "localhost")
+                                .header("language", "zh_CN")
+                                .header("content-type", "application/json; charset=UTF-8")
+                                .header("accept-encoding", "gzip")
+                                .header("user-agent", "okhttp/4.2.2")
+                                .post(body)
+                                .build();
 
-                    logToUi("[HTTP] 发送 POST " + url + "（" + cmdLabel(cmd) + "）"
-                            + "\n[HTTP] 请求体: " + jsonBody);
+                        logToUi("[HTTP] 发送 POST " + url + "（" + cmdLabel(cmd) + "）"
+                                + (attempt > 1 ? " [第 " + attempt + " 次尝试]" : "")
+                                + "\n[HTTP] 请求体: " + jsonBody);
 
-                    Response response = httpClient.newCall(request).execute();
-                    int code = response.code();
-                    String resp = readBody(response);
-                    logToUi("[HTTP] 响应 code=" + code + "\n[HTTP] 响应体: " + resp);
-                } catch (Exception e) {
-                    StringBuilder err = new StringBuilder(e.toString());
-                    Throwable cause = e.getCause();
-                    int depth = 0;
-                    while (cause != null && depth < 5) {
-                        err.append("\n  由 ").append(cause.toString()).append(" 引起");
-                        cause = cause.getCause();
-                        depth++;
+                        Response response = httpClient.newCall(request).execute();
+                        int code = response.code();
+                        String resp = readBody(response);
+                        if (attempt > 1) {
+                            logToUi("[HTTP] 第 " + attempt + " 次尝试成功");
+                        }
+                        logToUi("[HTTP] 响应 code=" + code + "\n[HTTP] 响应体: " + resp);
+                        return;
+                    } catch (Exception e) {
+                        StringBuilder err = new StringBuilder(e.toString());
+                        Throwable cause = e.getCause();
+                        int depth = 0;
+                        while (cause != null && depth < 5) {
+                            err.append("\n  由 ").append(cause.toString()).append(" 引起");
+                            cause = cause.getCause();
+                            depth++;
+                        }
+                        if (attempt < MAX_ATTEMPTS) {
+                            logToUi("[HTTP] 第 " + attempt + " 次请求失败: " + err
+                                    + "\n[HTTP] " + (RETRY_DELAY_MS / 1000) + " 秒后自动重试（"
+                                    + (MAX_ATTEMPTS - attempt) + " 次剩余）");
+                            try {
+                                Thread.sleep(RETRY_DELAY_MS);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                logToUi("[HTTP] 重试被中断，放弃请求");
+                                return;
+                            }
+                        } else {
+                            logToUi("[HTTP] 请求失败（已重试 " + (MAX_ATTEMPTS - 1) + " 次）: " + err);
+                        }
                     }
-                    logToUi("[HTTP] 请求失败: " + err);
                 }
             }
         });
