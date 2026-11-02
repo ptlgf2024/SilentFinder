@@ -1,6 +1,9 @@
 package com.example.silentfinder;
 
 import android.app.AlarmManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.BroadcastReceiver;
@@ -11,6 +14,7 @@ import android.content.SharedPreferences;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Process;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -37,6 +41,17 @@ public class SilentModeService extends Service {
 
     private static final String TAG = "SilentModeService";
     private static final int NOTIFICATION_ID = 1;
+    /** 可见渠道：IMPORTANCE_LOW 显示一条常驻通知（微信同款做法，显著降低被回收概率） */
+    public static final String CHANNEL_ID_VISIBLE = "silent_monitor_visible";
+    /**
+     * 彻底隐藏渠道：IMPORTANCE_NONE。
+     * 部分 ROM（本机 ColorOS 已实测）会把 MIN 渠道强行提升为 LOW 继续显示，
+     * 因此「隐藏」档使用 NONE 级别的新渠道，系统不会展示其通知条目。
+     */
+    private static final String CHANNEL_ID_SILENT = "silent_monitor_off";
+    /** 「常驻通知」开关变更后由界面触发刷新前台通知 */
+    public static final String ACTION_REFRESH_NOTIFICATION =
+            "com.example.silentfinder.REFRESH_NOTIFICATION";
     private static final String BASE_URL = "https://www.tailgdd.com/v1/api/app/device/cmd/";
     /** 寻车指令（切到静音档触发） */
     private static final String CMD_SEARCH = "search";
@@ -66,6 +81,26 @@ public class SilentModeService extends Service {
     // 公共 SDK 中 ACTION_RINGER_MODE_CHANGED / EXTRA_RINGER_MODE 被隐藏，使用实际字符串常量
     private static final String ACTION_RINGER_MODE_CHANGED = "android.media.RINGER_MODE_CHANGED";
     private static final String EXTRA_RINGER_MODE = "android.media.EXTRA_RINGER_MODE";
+    /**
+     * 上一次已处理的铃声模式。
+     * 广播与轮询两条通道会对同一次切换各触发一次，按模式去重可避免重复发指令。
+     */
+    private int lastHandledMode = -1;
+
+    /** 轮询周期：不依赖任何系统通知（广播/Settings），直接比较系统当前铃声模式，睡眠唤醒后也能自动对齐状态 */
+    private static final long POLL_INTERVAL_MS = 1_000L;
+
+    /** 持久化的「最后一次已处理的铃声模式」：进程被杀重启后可发现并补上遗漏的那次切换 */
+    private static final String PREF_KEY_LAST_MODE = "last_ringer_mode";
+
+    private final Runnable pollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            int mode = currentRingerMode();
+            if (mode >= 0) handleRingerMode(mode);
+            handler.postDelayed(this, POLL_INTERVAL_MS);
+        }
+    };
 
     /** 供主界面查询服务是否在运行 */
     public static volatile boolean isRunning = false;
@@ -73,8 +108,62 @@ public class SilentModeService extends Service {
     /** 用户主动停止时置 true，闹钟看门狗与自愈重启据此跳过拉起 */
     public static volatile boolean userStopped = false;
 
-    /** 看门狗周期：进程被杀后由系统闹钟自动拉起服务（无通知的后台服务更易被杀，周期缩短） */
-    private static final long WATCHDOG_INTERVAL_MS = 30_000L;
+    /** 「用户主动停止」是否持久化的键：进程被杀后重建仍能记住用户的停止状态 */
+    private static final String PREF_KEY_STOPPED = "stopped";
+
+    /** 是否已成功提升为前台服务 */
+    private volatile boolean foreground = false;
+
+    /**
+     * 看门狗周期：进程被杀后由系统闹钟自动拉起服务。
+     * 常驻通知启用后进程存活率已大幅提高，30 秒一次的闹钟（每天 2880 次唤醒）收益很低、代价明确，
+     * 故放宽到 3 分钟；服务被正常销毁时另有 2 秒的即时自愈闹钟，实际恢复通常在数秒内。
+     */
+    public static final long WATCHDOG_INTERVAL_MS = 180_000L;
+
+    // ── 统一的启停入口（开机广播 / 看门狗任务 / 界面共用）──
+
+    /** 读取持久化的「用户主动停止」标记 */
+    public static boolean isUserStopped(Context context) {
+        return context.getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(PREF_KEY_STOPPED, false);
+    }
+
+    /** 写入「用户主动停止」标记（同时更新进程内标记，重启失效前可被其他组件直接读取） */
+    public static void setUserStopped(Context context, boolean stopped) {
+        userStopped = stopped;
+        context.getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_KEY_STOPPED, stopped).apply();
+    }
+
+    /**
+     * 拉起监听服务（唯一的启动入口）。
+     * Android 8+ 禁止在后台普通 startService，必须以「前台服务」方式启动；
+     * 若仍被 ROM 拦截则退化为普通启动，并由已注册的看门狗闹钟 + 持久化任务继续兜底。
+     */
+    public static void ensureStarted(Context context) {
+        if (isUserStopped(context)) {
+            Log.i(TAG, "用户已主动停止监听，跳过本次拉起");
+            return;
+        }
+        Intent intent = new Intent(context, SilentModeService.class);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "前台方式拉起失败，退化为普通后台启动: " + t);
+            try {
+                context.startService(intent);
+            } catch (Throwable t2) {
+                Log.e(TAG, "普通后台启动也被拒绝，等待看门狗兜底: " + t2);
+            }
+        }
+        // 注册持久化周期任务：跨关机重启存活，开机广播被拦时仍能拉起
+        WatchdogJobService.schedule(context);
+    }
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
@@ -111,60 +200,132 @@ public class SilentModeService extends Service {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (!ACTION_RINGER_MODE_CHANGED.equals(intent.getAction())) return;
-            int ringerMode = intent.getIntExtra(EXTRA_RINGER_MODE, -1);
-            if (ringerMode == AudioManager.RINGER_MODE_SILENT) {
-                // 静音档：取消停止计时（离开震动档），清零双拨计数，立即寻车
-                cancelStopTimer();
-                lastVibrateAt = 0L;
-                logToUi("[监听] 检测到静音模式，触发寻车请求");
-                sendCmd(CMD_SEARCH);
-            } else if (ringerMode == AudioManager.RINGER_MODE_VIBRATE) {
-                cancelStopTimer();
-                long now = SystemClock.elapsedRealtime();
-                if (lastVibrateAt != 0 && (now - lastVibrateAt) <= CONSECUTIVE_WINDOW_MS) {
-                    // 连续第二次震动：触发车辆启动指令，并清零计数
-                    lastVibrateAt = 0L;
-                    logToUi("[监听] " + (CONSECUTIVE_WINDOW_MS / 1000) + " 秒内连续第二次震动模式，触发车辆启动指令"
-                            + "（保持不动 " + (HOLD_STOP_MS / 1000) + " 秒将触发停止）");
-                    sendCmd(CMD_START);
-                } else {
-                    lastVibrateAt = now;
-                    logToUi("[监听] 切换到震动模式（" + (CONSECUTIVE_WINDOW_MS / 1000)
-                            + " 秒内再次震动将触发启动；保持不动 "
-                            + (HOLD_STOP_MS / 1000) + " 秒将触发停止）");
-                }
-                // 保持不动到时即停；期间再次拨动会先取消本计时再重新安排
-                scheduleStopTimer();
-            } else if (ringerMode == AudioManager.RINGER_MODE_NORMAL) {
-                // 正常档：取消停止计时。注意：不清零 lastVibrateAt，
-                // 否则双拨手势（震动→正常→震动）中间的正常档事件会打断连续判定
-                cancelStopTimer();
-                logToUi("[监听] 恢复正常模式（不触发请求）");
-            }
+            int extra = intent.getIntExtra(EXTRA_RINGER_MODE, -1);
+            int systemMode = currentRingerMode();
+            // 部分 ROM 派发的广播不带 EXTRA_RINGER_MODE（此时 extra 为 -1），直接读 AudioManager 兜底
+            int ringerMode = extra >= 0 ? extra : systemMode;
+            logDebug("收到铃声广播：extra=" + modeName(extra) + "，系统当前=" + modeName(systemMode)
+                    + "，采用=" + modeName(ringerMode));
+            handleRingerMode(ringerMode);
         }
     };
+
+    /**
+     * 铃声模式变化处理（广播与 Settings 两条通道共用）。
+     * 与上一次已处理的模式相同则忽略，避免两条通道对同一次切换各发一次指令。
+     */
+    private void handleRingerMode(int ringerMode) {
+        if (ringerMode < 0) return;
+        if (ringerMode == lastHandledMode) return;
+        lastHandledMode = ringerMode;
+        persistLastMode(ringerMode);
+        if (ringerMode == AudioManager.RINGER_MODE_SILENT) {
+            // 静音档：取消停止计时（离开震动档），清零双拨计数，立即寻车
+            cancelStopTimer();
+            lastVibrateAt = 0L;
+            logToUi("[监听] 检测到静音模式，触发寻车请求");
+            sendCmd(CMD_SEARCH);
+        } else if (ringerMode == AudioManager.RINGER_MODE_VIBRATE) {
+            cancelStopTimer();
+            long now = SystemClock.elapsedRealtime();
+            if (lastVibrateAt != 0 && (now - lastVibrateAt) <= CONSECUTIVE_WINDOW_MS) {
+                // 连续第二次震动：触发车辆启动指令，并清零计数
+                lastVibrateAt = 0L;
+                logToUi("[监听] " + (CONSECUTIVE_WINDOW_MS / 1000) + " 秒内连续第二次震动模式，触发车辆启动指令"
+                        + "（保持不动 " + (HOLD_STOP_MS / 1000) + " 秒将触发停止）");
+                sendCmd(CMD_START);
+            } else {
+                lastVibrateAt = now;
+                logToUi("[监听] 切换到震动模式（" + (CONSECUTIVE_WINDOW_MS / 1000)
+                        + " 秒内再次震动将触发启动；保持不动 "
+                        + (HOLD_STOP_MS / 1000) + " 秒将触发停止）");
+            }
+            // 保持不动到时即停；期间再次拨动会先取消本计时再重新安排
+            scheduleStopTimer();
+        } else if (ringerMode == AudioManager.RINGER_MODE_NORMAL) {
+            // 正常档：取消停止计时。注意：不清零 lastVibrateAt，
+            // 否则双拨手势（震动→正常→震动）中间的正常档事件会打断连续判定
+            cancelStopTimer();
+            logToUi("[监听] 恢复正常模式（不触发请求）");
+        }
+    }
+
+    /** 读取持久化的「最后一次已处理的铃声模式」（无记录返回 -1） */
+    private int readLastMode() {
+        return getSharedPreferences(MainActivity.PREFS_NAME, MODE_PRIVATE)
+                .getInt(PREF_KEY_LAST_MODE, -1);
+    }
+
+    private void persistLastMode(int mode) {
+        getSharedPreferences(MainActivity.PREFS_NAME, MODE_PRIVATE)
+                .edit().putInt(PREF_KEY_LAST_MODE, mode).apply();
+    }
+
+    /** 读取系统当前铃声模式（读不到返回 -1） */
+    private int currentRingerMode() {
+        try {
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            return am != null ? am.getRingerMode() : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 铃声模式的可读名称，便于在日志里判断通道实际拿到的是什么值 */
+    private static String modeName(int mode) {
+        switch (mode) {
+            case AudioManager.RINGER_MODE_SILENT:
+                return "静音(" + AudioManager.RINGER_MODE_SILENT + ")";
+            case AudioManager.RINGER_MODE_VIBRATE:
+                return "震动(" + AudioManager.RINGER_MODE_VIBRATE + ")";
+            case AudioManager.RINGER_MODE_NORMAL:
+                return "正常(" + AudioManager.RINGER_MODE_NORMAL + ")";
+            default:
+                return "未知(" + mode + ")";
+        }
+    }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        // 进程可能已被杀后重建：从持久化标记恢复「用户主动停止」状态
+        userStopped = isUserStopped(this);
         isRunning = true;
+        startForegroundQuietly();
         IntentFilter filter = new IntentFilter(ACTION_RINGER_MODE_CHANGED);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(ringerReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(ringerReceiver, filter);
         }
-        logToUi("[服务] 监听服务已启动，正在监听铃声模式变化");
+        // 继承上次已处理的模式（进程被杀重启后即刻比对，补上期间被漏掉的切换）
+        lastHandledMode = readLastMode();
+        int bootMode = currentRingerMode();
+        logToUi("[服务] 监听服务已启动（pid=" + Process.myPid() + "）");
+        logDebug("上次处理模式=" + modeName(lastHandledMode) + "，当前系统模式=" + modeName(bootMode)
+                + "，通知样式=" + notificationStyle(this));
+        if (bootMode >= 0) {
+            handleRingerMode(bootMode);
+        }
+        // 轮询兜底：不依赖系统任何通知，每 POLL_INTERVAL_MS 比对一次真实模式
+        handler.post(pollRunnable);
         if (getAuth().isEmpty()) {
             logToUi("[服务] 尚未设置 authorization，请在菜单「设置 authorization」中配置后再触发请求");
+        }
+        if (getImei().isEmpty()) {
+            logToUi("[服务] 尚未设置车辆 IMEI，请在菜单「设置车辆 IMEI」中配置后再触发请求");
         }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // 界面改了「常驻通知」开关：立刻重建通知（渠道不同需要重新 build）
+        if (intent != null && ACTION_REFRESH_NOTIFICATION.equals(intent.getAction())) {
+            refreshForegroundNotification();
+        }
         // 周期性重设看门狗闹钟：即使进程被系统杀死，闹钟也会拉起本服务
         if (!userStopped) {
-            scheduleWatchdog(WATCHDOG_INTERVAL_MS);
+            scheduleWatchdog(this, WATCHDOG_INTERVAL_MS);
         }
         // START_STICKY：服务被系统杀死后会尽量重建，保证常驻
         return START_STICKY;
@@ -173,6 +334,14 @@ public class SilentModeService extends Service {
     @Override
     public void onDestroy() {
         isRunning = false;
+        try {
+            if (foreground && Build.VERSION.SDK_INT >= 26) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            }
+        } catch (Throwable ignored) {
+        }
+        foreground = false;
+        handler.removeCallbacks(pollRunnable);
         unregisterReceiver(ringerReceiver);
         cancelStopTimer();
         executor.shutdown();
@@ -207,6 +376,25 @@ public class SilentModeService extends Service {
         return sp.getString(MainActivity.PREF_KEY_IMEI, "").trim();
     }
 
+    /**
+     * 详细日志：只写 logcat，默认不进界面日志区；
+     * 需要排查时可在菜单「🐞 详细日志」里临时开启。
+     */
+    private void logDebug(String msg) {
+        Log.d(TAG, msg);
+        if (getSharedPreferences(MainActivity.PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(MainActivity.PREF_KEY_VERBOSE_LOG, false)) {
+            logToUi("[调试] " + msg);
+        }
+    }
+
+    /** 长文本截断，避免异常堆栈或超长响应体占满日志区 */
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        String t = s.trim();
+        return t.length() <= max ? t : t.substring(0, max) + "…";
+    }
+
     /** 把日志同时写入 logcat 和广播到主界面（时间戳由界面统一添加） */
     private void logToUi(String msg) {
         Log.i(TAG, msg);
@@ -215,16 +403,20 @@ public class SilentModeService extends Service {
         // 再广播给前台界面实时刷新（界面不在前台时广播无人接收，无影响）
         Intent i = new Intent(MainActivity.ACTION_LOG);
         i.setPackage(getPackageName());
-        i.putExtra(MainActivity.EXTRA_LOG_MSG, msg);
         sendBroadcast(i);
     }
 
     /** 看门狗：安排一个系统闹钟，到时由系统直接拉起本服务（进程死了也能唤醒） */
     private void scheduleWatchdog(long delayMs) {
+        scheduleWatchdog(this, delayMs);
+    }
+
+    /** 看门狗：安排一个系统闹钟，到时由系统直接拉起本服务（进程死了也能唤醒） */
+    public static void scheduleWatchdog(Context context, long delayMs) {
         try {
-            AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+            AlarmManager am = (AlarmManager) context.getSystemService(ALARM_SERVICE);
             if (am == null) return;
-            PendingIntent pi = getRestartPendingIntent();
+            PendingIntent pi = getRestartPendingIntent(context);
             long at = SystemClock.elapsedRealtime() + delayMs;
             if (Build.VERSION.SDK_INT >= 23) {
                 am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, pi);
@@ -236,19 +428,133 @@ public class SilentModeService extends Service {
         }
     }
 
-    private void cancelWatchdog() {
+    public static void cancelWatchdog(Context context) {
         try {
-            AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
-            if (am != null) am.cancel(getRestartPendingIntent());
+            AlarmManager am = (AlarmManager) context.getSystemService(ALARM_SERVICE);
+            if (am != null) am.cancel(getRestartPendingIntent(context));
         } catch (Exception ignored) {
         }
     }
 
-    private PendingIntent getRestartPendingIntent() {
-        Intent i = new Intent(this, SilentModeService.class);
+    private void cancelWatchdog() {
+        cancelWatchdog(this);
+    }
+
+    /**
+     * 重启用 PendingIntent：Android 8+ 后台限制同样适用于闹钟触发的普通 startService，
+     * 因此 API 26+ 使用 getForegroundService 创建。
+     */
+    private static PendingIntent getRestartPendingIntent(Context context) {
+        Intent i = new Intent(context, SilentModeService.class);
         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
-        return PendingIntent.getService(this, 0, i, flags);
+        if (Build.VERSION.SDK_INT >= 26) {
+            return PendingIntent.getForegroundService(context, 0, i, flags);
+        }
+        return PendingIntent.getService(context, 0, i, flags);
+    }
+
+    /**
+     * 读取通知样式：
+     * standard（标题 + 说明）/ minimal（仅标题）/ hidden（状态栏不显示）。
+     * 旧版「常驻通知」总开关关闭时视为 hidden，保证升级后行为不变。
+     */
+    public static String notificationStyle(Context context) {
+        SharedPreferences sp =
+                context.getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE);
+        if (!sp.getBoolean(MainActivity.PREF_KEY_SHOW_NOTI, true)) {
+            return MainActivity.NOTI_STYLE_HIDDEN;
+        }
+        return sp.getString(MainActivity.PREF_KEY_NOTI_STYLE, MainActivity.NOTI_STYLE_STANDARD);
+    }
+
+    /**
+     * 提升为前台服务：Android 8+ 只有前台服务才能可靠地在后台长期存活并从开机广播被拉起。
+     * 通知分两档：默认显示一条 IMPORTANCE_LOW 常驻通知（无声、不打扰，但系统能感知服务在被使用，
+     * 与微信「微信正在运行」同思路，显著降低被 ROM 回收的概率）；用户在菜单中关闭后退回静默渠道。
+     * 若被个别 ROM 拒绝，则退化为普通后台服务（由看门狗继续保活）。
+     */
+    private void startForegroundQuietly() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        try {
+            ensureChannels();
+            startForeground(NOTIFICATION_ID, buildNotification());
+            foreground = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "前台化失败，退化为普通后台服务: " + t);
+        }
+    }
+
+    /** 开关变更后重建通知并重新提交前台状态（渠道不同，必须重新 build） */
+    private void refreshForegroundNotification() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        try {
+            ensureChannels();
+            Notification notification = buildNotification();
+            startForeground(NOTIFICATION_ID, notification);
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(NOTIFICATION_ID, notification);
+        } catch (Throwable t) {
+            Log.w(TAG, "刷新前台通知失败: " + t);
+        }
+    }
+
+    /** 创建两个通知渠道：可见（IMPORTANCE_LOW）与隐藏（IMPORTANCE_NONE） */
+    private void ensureChannels() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm == null) return;
+
+        if (nm.getNotificationChannel(CHANNEL_ID_VISIBLE) == null) {
+            NotificationChannel visible = new NotificationChannel(
+                    CHANNEL_ID_VISIBLE, "静音寻车监听服务（常驻）", NotificationManager.IMPORTANCE_LOW);
+            visible.setDescription("常驻通知：让系统知道服务正在使用，显著降低被后台回收的概率。可在应用菜单中关闭");
+            visible.setShowBadge(false);
+            visible.enableVibration(false);
+            visible.setSound(null, null);
+            nm.createNotificationChannel(visible);
+        }
+        if (nm.getNotificationChannel(CHANNEL_ID_SILENT) == null) {
+            NotificationChannel silent = new NotificationChannel(
+                    CHANNEL_ID_SILENT, "静音寻车（已隐藏）", NotificationManager.IMPORTANCE_NONE);
+            silent.setDescription("隐藏档渠道：通知不展示，仅用于维持前台服务状态");
+            silent.setShowBadge(false);
+            silent.enableVibration(false);
+            silent.setSound(null, null);
+            nm.createNotificationChannel(silent);
+        }
+    }
+
+    /** 按当前通知样式构建通知：标准（标题+说明）/ 极简（仅标题）/ 隐藏（不显示条目） */
+    private Notification buildNotification() {
+        String style = notificationStyle(this);
+        boolean hidden = MainActivity.NOTI_STYLE_HIDDEN.equals(style);
+        boolean minimal = MainActivity.NOTI_STYLE_MINIMAL.equals(style);
+        String channelId = hidden ? CHANNEL_ID_SILENT : CHANNEL_ID_VISIBLE;
+
+        Intent openIntent = new Intent(this, MainActivity.class);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
+        PendingIntent pi = PendingIntent.getActivity(this, 0, openIntent, flags);
+
+        int icon = getApplicationInfo().icon;
+        if (icon == 0) icon = android.R.drawable.sym_def_app_icon;
+
+        Notification.Builder builder = new Notification.Builder(this, channelId)
+                .setSmallIcon(icon)
+                .setContentTitle("静音寻车已就绪")
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setCategory(Notification.CATEGORY_SERVICE);
+        if (!minimal && !hidden) {
+            // 标准档才显示说明文字，极简档只留一行标题
+            builder.setContentText("正在监听三段式按键，点击打开应用");
+        }
+        if (hidden) {
+            builder.setVisibility(Notification.VISIBILITY_SECRET);
+        }
+        return builder.build();
     }
 
     /** 使用 OkHttp 在后台线程执行 HTTP/2 POST 请求；未设置 authorization/IMEI 时不发送 */
@@ -285,31 +591,34 @@ public class SilentModeService extends Service {
                                 .post(body)
                                 .build();
 
-                        logToUi("[HTTP] 发送 POST " + url + "（" + cmdLabel(cmd) + "）"
-                                + (attempt > 1 ? " [第 " + attempt + " 次尝试]" : "")
-                                + "\n[HTTP] 请求体: " + jsonBody);
+                        logToUi("[HTTP] 发送" + cmdLabel(cmd) + "请求"
+                                + (attempt > 1 ? "（第 " + attempt + " 次尝试）" : ""));
+                        logDebug("POST " + url + "，请求体: " + jsonBody);
 
                         Response response = httpClient.newCall(request).execute();
                         int code = response.code();
                         String resp = readBody(response);
-                        if (attempt > 1) {
-                            logToUi("[HTTP] 第 " + attempt + " 次尝试成功");
+                        if (code >= 200 && code < 300) {
+                            logToUi("[HTTP] " + cmdLabel(cmd) + "请求成功，code=" + code);
+                            logDebug("响应体: " + truncate(resp, 500));
+                        } else {
+                            logToUi("[HTTP] " + cmdLabel(cmd) + "请求返回 code=" + code
+                                    + "，响应：" + truncate(resp, 120));
                         }
-                        logToUi("[HTTP] 响应 code=" + code + "\n[HTTP] 响应体: " + resp);
                         return;
                     } catch (Exception e) {
                         StringBuilder err = new StringBuilder(e.toString());
                         Throwable cause = e.getCause();
                         int depth = 0;
                         while (cause != null && depth < 5) {
-                            err.append("\n  由 ").append(cause.toString()).append(" 引起");
+                            err.append(" / ").append(cause);
                             cause = cause.getCause();
                             depth++;
                         }
+                        logDebug("请求异常: " + err);
                         if (attempt < MAX_ATTEMPTS) {
-                            logToUi("[HTTP] 第 " + attempt + " 次请求失败: " + err
-                                    + "\n[HTTP] " + (RETRY_DELAY_MS / 1000) + " 秒后自动重试（"
-                                    + (MAX_ATTEMPTS - attempt) + " 次剩余）");
+                            logToUi("[HTTP] 请求失败：" + truncate(err.toString(), 100)
+                                    + "，" + (RETRY_DELAY_MS / 1000) + " 秒后重试");
                             try {
                                 Thread.sleep(RETRY_DELAY_MS);
                             } catch (InterruptedException ie) {
@@ -318,7 +627,8 @@ public class SilentModeService extends Service {
                                 return;
                             }
                         } else {
-                            logToUi("[HTTP] 请求失败（已重试 " + (MAX_ATTEMPTS - 1) + " 次）: " + err);
+                            logToUi("[HTTP] 请求失败（已重试 " + (MAX_ATTEMPTS - 1) + " 次）："
+                                    + truncate(err.toString(), 100));
                         }
                     }
                 }

@@ -11,8 +11,9 @@ import java.util.Locale;
  */
 public final class LogStore {
 
-    public static final int MAX_LINES = 500;
-    public static final ArrayDeque<String> BUFFER = new ArrayDeque<>();
+    /** 日志最多保留的行数（超出丢弃最旧的） */
+    private static final int MAX_LINES = 500;
+    private static final ArrayDeque<String> BUFFER = new ArrayDeque<>();
 
     private static final SimpleDateFormat FMT =
             new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.getDefault());

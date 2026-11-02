@@ -35,12 +35,23 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
 
     public static final String ACTION_LOG = "com.example.silentfinder.LOG";
-    public static final String EXTRA_LOG_MSG = "log_msg";
 
     public static final String PREFS_NAME = "config";
     public static final String PREF_KEY_AUTH = "auth";
     public static final String PREF_KEY_IMEI = "imei";
     public static final String PREF_KEY_FIRST_RUN = "first_run";
+    /** 「常驻通知」总开关：仅用于旧版兼容（关闭视为隐藏样式） */
+    public static final String PREF_KEY_SHOW_NOTI = "show_notification";
+    /** 通知样式：standard（标题+说明）/ minimal（仅标题）/ hidden（不显示） */
+    public static final String PREF_KEY_NOTI_STYLE = "notification_style";
+    public static final String NOTI_STYLE_STANDARD = "standard";
+    public static final String NOTI_STYLE_MINIMAL = "minimal";
+    public static final String NOTI_STYLE_HIDDEN = "hidden";
+    /** 「详细日志」开关：开启后日志区才显示调试明细（默认关闭，保持日志区清爽） */
+    public static final String PREF_KEY_VERBOSE_LOG = "verbose_log";
+
+    /** 通知权限请求码（Android 13+） */
+    private static final int REQ_POST_NOTIFICATIONS = 1001;
 
     // 配色
     private static final int COLOR_PRIMARY = 0xFF1565C0;      // 主色：深蓝
@@ -57,7 +68,6 @@ public class MainActivity extends Activity {
     private static volatile boolean serviceRequested = false;
 
     private Button toggleButton;
-    private TextView statusValue;
     private LinearLayout rowMode, rowService, rowAuth, rowImei;
     private TextView logText;
     private ScrollView logScroll;
@@ -204,9 +214,18 @@ public class MainActivity extends Activity {
         }
 
         // 打开应用时自动启动监听服务（无需手动点启动）
+        SilentModeService.setUserStopped(this, false);
         if (!SilentModeService.isRunning) {
-            SilentModeService.userStopped = false;
             startMonitorService();
+        }
+
+        // Android 13+：常驻通知需要通知权限。未授予时服务照常运行，但通知不显示、后台更易被回收
+        if (Build.VERSION.SDK_INT >= 33
+                && getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_KEY_SHOW_NOTI, true)
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    REQ_POST_NOTIFICATIONS);
         }
 
         // 首次运行（或尚未完成电池白名单）时弹出保活设置引导
@@ -252,7 +271,7 @@ public class MainActivity extends Activity {
         name.setLayoutParams(new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        statusValue = new TextView(this);
+        TextView statusValue = new TextView(this);
         statusValue.setText(value);
         statusValue.setTextSize(15);
         statusValue.setTypeface(Typeface.DEFAULT_BOLD);
@@ -274,13 +293,18 @@ public class MainActivity extends Activity {
 
     // ── 菜单 ──
 
-    /** 主菜单：设置 authorization / 设置 IMEI / 电池优化白名单 / 关于 */
+    /** 主菜单：authorization / IMEI / 通知样式 / 详细日志 / 耗电管理 / 自启动 / 关于 */
     private void showMainMenu() {
+        SharedPreferences sp = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean verbose = sp.getBoolean(PREF_KEY_VERBOSE_LOG, false);
         final String[] items = {
                 "🔑  设置 authorization",
                 "🚗  设置车辆 IMEI",
+                "🔔  通知样式：" + styleLabel(SilentModeService.notificationStyle(this)),
+                verbose ? "🐞  详细日志：已开启（点此关闭）" : "🐞  详细日志：已关闭（点此开启）",
                 "🔋  耗电管理（完全允许后台行为）",
                 "🚀  自启动设置",
+                "📴  在系统设置中屏蔽通知（服务仍保活）",
                 "ℹ️  关于"
         };
         new AlertDialog.Builder(this)
@@ -293,15 +317,124 @@ public class MainActivity extends Activity {
                         } else if (which == 1) {
                             showImeiSetting();
                         } else if (which == 2) {
-                            requestIgnoreBatteryOptimizations();
+                            chooseNotificationStyle();
                         } else if (which == 3) {
+                            toggleVerboseLog();
+                        } else if (which == 4) {
+                            requestIgnoreBatteryOptimizations();
+                        } else if (which == 5) {
                             jumpToAutoStartSettings();
+                        } else if (which == 6) {
+                            openNotificationChannelSettings();
                         } else {
                             showAbout();
                         }
                     }
                 })
                 .show();
+    }
+
+    /** 通知样式的可读名称 */
+    private static String styleLabel(String style) {
+        if (NOTI_STYLE_MINIMAL.equals(style)) return "极简（仅一行标题）";
+        if (NOTI_STYLE_HIDDEN.equals(style)) return "隐藏（不显示，更易被回收）";
+        return "标准（标题 + 说明）";
+    }
+
+    /**
+     * 选择通知样式：
+     * 标准 = 状态栏显示"标题 + 说明"；极简 = 只留一行标题；隐藏 = 不显示通知条目。
+     * 可见的两档能让系统感知服务在使用中，存活率最高；隐藏档更清爽但更易被回收。
+     */
+    private void chooseNotificationStyle() {
+        final String[] labels = {
+                "标准：静音寻车已就绪 · 正在监听三段式按键",
+                "极简：只显示「静音寻车已就绪」一行",
+                "隐藏：状态栏不显示（更容易被系统回收）"
+        };
+        final String[] values = {NOTI_STYLE_STANDARD, NOTI_STYLE_MINIMAL, NOTI_STYLE_HIDDEN};
+        String current = SilentModeService.notificationStyle(this);
+        int checked = 0;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i].equals(current)) checked = i;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("通知样式（当前：" + styleLabel(current) + "）")
+                .setSingleChoiceItems(labels, checked, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        dialog.dismiss();
+                        applyNotificationStyle(values[which]);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 保存通知样式并让服务立刻重建通知 */
+    private void applyNotificationStyle(String style) {
+        boolean hidden = NOTI_STYLE_HIDDEN.equals(style);
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_KEY_SHOW_NOTI, !hidden)
+                .putString(PREF_KEY_NOTI_STYLE, style)
+                .apply();
+
+        if (!hidden && Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    REQ_POST_NOTIFICATIONS);
+        }
+        // 渠道不同，必须让服务重新 build 通知并重新提交前台状态
+        Intent i = new Intent(this, SilentModeService.class);
+        i.setAction(SilentModeService.ACTION_REFRESH_NOTIFICATION);
+        try {
+            startService(i);
+        } catch (Exception ignored) {
+            // 服务未运行时忽略，下次启动按新样式生效
+        }
+        appendLog("[设置] 通知样式已改为" + styleLabel(style) + (hidden
+                ? "：状态栏不再显示，但后台更容易被系统回收"
+                : "：让系统感知服务在使用中，存活率更高"));
+        Toast.makeText(this, "通知样式：" + styleLabel(style), Toast.LENGTH_SHORT).show();
+    }
+
+    /** 跳到系统通知设置，用户可自行关闭/静默该渠道（服务仍以前台身份运行） */
+    private void openNotificationChannelSettings() {
+        try {
+            Intent i = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
+            i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+            i.putExtra(Settings.EXTRA_CHANNEL_ID, SilentModeService.CHANNEL_ID_VISIBLE);
+            startActivity(i);
+        } catch (Exception e) {
+            try {
+                Intent i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                startActivity(i);
+            } catch (Exception e2) {
+                Toast.makeText(this, "无法打开系统通知设置", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    /** 切换「详细日志」：关闭时日志区只保留动作与结果，调试明细只写 logcat */
+    private void toggleVerboseLog() {
+        SharedPreferences sp = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean next = !sp.getBoolean(PREF_KEY_VERBOSE_LOG, false);
+        sp.edit().putBoolean(PREF_KEY_VERBOSE_LOG, next).apply();
+        appendLog("[设置] 详细日志已" + (next ? "开启（将显示调试明细）" : "关闭（日志区只保留动作与结果）"));
+        Toast.makeText(this, next ? "详细日志已开启" : "详细日志已关闭", Toast.LENGTH_SHORT).show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_POST_NOTIFICATIONS) return;
+        boolean granted = grantResults != null && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        appendLog(granted
+                ? "[权限] 通知权限已授予，常驻通知将正常显示"
+                : "[权限] 通知权限被拒绝：服务照常运行，但无法显示常驻通知，后台更容易被回收");
     }
 
     // ── 首次运行引导 ──
@@ -566,22 +699,23 @@ public class MainActivity extends Activity {
     private void toggleService() {
         if (SilentModeService.isRunning || serviceRequested) {
             serviceRequested = false;
-            SilentModeService.userStopped = true;
+            SilentModeService.setUserStopped(this, true);
             stopService(new Intent(this, SilentModeService.class));
             appendLog("[界面] 已请求停止监听服务");
             Toast.makeText(this, "监听服务已停止", Toast.LENGTH_SHORT).show();
             scheduleRefresh();
         } else {
-            SilentModeService.userStopped = false;
+            SilentModeService.setUserStopped(this, false);
             startMonitorService();
         }
     }
 
-    /** 启动监听服务（纯后台服务，无通知） */
+    /** 启动监听服务 */
     private void startMonitorService() {
         serviceRequested = true;
         refreshUi();
-        startService(new Intent(this, SilentModeService.class));
+        // 走统一入口：前台方式启动 + 注册持久化看门狗任务
+        SilentModeService.ensureStarted(this);
         appendLog("[界面] 已请求启动监听服务");
         Toast.makeText(this, "监听服务已启动", Toast.LENGTH_SHORT).show();
         scheduleRefresh();

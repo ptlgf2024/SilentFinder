@@ -4,10 +4,16 @@
 
     <!-- 网络权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- 开机自启 -->
+    <!-- 开机自启（同时是 JobScheduler 持久化任务的前提权限） -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- 申请加入电池优化白名单（后台常驻） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Android 8+ 禁止后台普通 startService：开机拉起必须以「前台服务」方式进行 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14（targetSdk 34）要求为前台服务声明类型，specialUse 不受「使用期间」限制 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ 显示常驻通知所需；拒绝也不影响服务运行，只是通知不显示、后台更易被回收 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- targetSdk 30+ 包可见性：声明各厂商自启动管理页所在包，否则跨包 startActivity 会被拦截 -->
     <queries>
@@ -43,15 +49,36 @@
             </intent-filter>
         </activity>
 
+        <!-- 前台服务：Android 8+ 唯一可靠地从开机广播拉起、且能长期存活的方式。
+             通知渠道设为 IMPORTANCE_MIN，且本应用不申请 Android 13+ 的 POST_NOTIFICATIONS，
+             因此在 Android 13+ 上不会显示通知条目。 -->
         <service
             android:name=".SilentModeService"
-            android:exported="false" />
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="监听系统铃声模式（三段式按键）并向自有车辆发送控制指令" />
+        </service>
 
+        <!-- 持久化看门狗任务：跨关机重启存活，兜底拉起监听服务 -->
+        <service
+            android:name=".WatchdogJobService"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- 开机自启：覆盖原生开机、用户解锁、应用升级以及部分 ROM 的「快速开机」广播 -->
         <receiver
             android:name=".BootReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
     </application>

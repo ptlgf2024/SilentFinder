@@ -11,8 +11,8 @@ android {
         applicationId "com.example.silentmonitor"
         minSdk 24
         targetSdk 34
-        versionCode 28
-        versionName "2.16"
+        versionCode 43
+        versionName "2.31"
     }
 
     compileOptions {
